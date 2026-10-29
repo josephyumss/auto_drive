@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>amr_vision</name>
+  <version>0.1.0</version>
+  <description>OAK-D YOLO UDP to ROS 2 bridge for obstacle avoidance.</description>
+  <maintainer email="team@example.com">Kookmin Robotics</maintainer>
+  <license>MIT</license>
+  <buildtool_depend>ament_python</buildtool_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>amr_interfaces</exec_depend>
+  <export><build_type>ament_python</build_type></export>
+</package>

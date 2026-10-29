@@ -1,0 +1,245 @@
+"""Automatic archives, failures, deduplication and early shell-exit capture."""
+import json
+import os
+from pathlib import Path
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import unittest
+from unittest import mock
+
+from jetson.amr_core.full_run_diagnostics import REQUEST_FILE, STATUS_FILE, create_bundle, request_auto_bundle
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class BundleTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="full-run-bundle-")
+        self.addCleanup(self.temp.cleanup)
+        self.folder = Path(self.temp.name) / "run"
+        self.folder.mkdir()
+        (self.folder / "launcher.log").write_bytes(b"startup\n")
+        (self.folder / "events.jsonl").write_text('{"event":"state","after":"FAULT_STOP"}\n', encoding="utf8")
+        (self.folder / "config.json").write_text('{"wheel_base_m":0.85}', encoding="utf8")
+
+    def test_first_fault_reason_is_preserved(self):
+        self.assertTrue(request_auto_bundle(self.folder, "STM32_data_lost"))
+        self.assertFalse(request_auto_bundle(self.folder, "later_shutdown"))
+        request = json.loads((self.folder / REQUEST_FILE).read_text())
+        self.assertEqual(request["reason"], "STM32_data_lost")
+
+    def test_automatic_archive_contains_logs_config_and_capture_metadata(self):
+        request_auto_bundle(self.folder, "STM32_data_lost")
+        destination = create_bundle(self.folder, automatic=True)
+        self.assertTrue(destination.is_file())
+        self.assertTrue((self.folder / "events.jsonl").is_file())
+        with tarfile.open(destination, "r:gz") as archive:
+            self.assertIn("run/config.json", archive.getnames())
+            metadata = json.load(archive.extractfile("run/bundle_metadata.json"))
+            self.assertTrue(metadata["automatic"])
+            self.assertEqual(metadata["trigger"]["reason"], "STM32_data_lost")
+            self.assertEqual(metadata["captured_files"]["launcher.log"], len(b"startup\n"))
+        status = json.loads((self.folder / STATUS_FILE).read_text())
+        self.assertTrue(status["complete"])
+
+    def test_successful_automatic_capture_is_not_overwritten_by_later_shutdown(self):
+        destination = create_bundle(self.folder, automatic=True, reason="first_fault")
+        original = destination.read_bytes()
+        (self.folder / "launcher.log").write_text("changed after fault; user stopped\n")
+        self.assertEqual(create_bundle(self.folder, automatic=True, reason="later_shutdown"), destination)
+        self.assertEqual(destination.read_bytes(), original)
+
+    def test_final_capture_adds_shutdown_errors_and_preserves_exact_first_fault(self):
+        destination = create_bundle(self.folder, automatic=True, reason="first_fault")
+        original = destination.read_bytes()
+        (self.folder / "shutdown.log").write_text("late UART/GPIO cleanup error\n")
+        (self.folder / "events.jsonl").write_text('{"event":"exception","context":"GPIO_cleanup"}\n')
+        self.assertEqual(create_bundle(self.folder, automatic=True, finalize=True), destination)
+        with tarfile.open(destination) as archive:
+            self.assertEqual(archive.extractfile("run/first_fault-debug.tar.gz").read(), original)
+            self.assertIn(b"late UART", archive.extractfile("run/shutdown.log").read())
+            summary = json.load(archive.extractfile("run/diagnostic_summary.json"))
+            self.assertEqual(summary["event_counts"]["exception"], 1)
+            metadata = json.load(archive.extractfile("run/bundle_metadata.json"))
+            self.assertTrue(metadata["finalized"])
+            self.assertEqual(metadata["trigger"]["reason"], "first_fault")
+        final = destination.read_bytes()
+        self.assertEqual(create_bundle(self.folder, automatic=True, finalize=True), destination)
+        self.assertEqual(destination.read_bytes(), final)
+
+    def test_failed_final_capture_keeps_original_first_fault_archive_and_status(self):
+        destination = create_bundle(self.folder, automatic=True)
+        original = destination.read_bytes()
+        original_status = (self.folder / STATUS_FILE).read_bytes()
+        with mock.patch("jetson.amr_core.full_run_diagnostics.tarfile.open", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                create_bundle(self.folder, automatic=True, finalize=True)
+        self.assertEqual(destination.read_bytes(), original)
+        self.assertEqual((self.folder / STATUS_FILE).read_bytes(), original_status)
+        self.assertFalse(list(self.folder.parent.glob("*.part")))
+
+    def test_corrupt_events_do_not_prevent_raw_archive_and_summary(self):
+        (self.folder / "events.jsonl").write_text('bad\n[]\nnull\n{}\n{"event":"state"}\n')
+        destination = create_bundle(self.folder, automatic=True)
+        with tarfile.open(destination) as archive:
+            summary = json.load(archive.extractfile("run/diagnostic_summary.json"))
+            self.assertEqual(summary["unreadable_lines"], 4)
+            self.assertEqual(summary["event_counts"]["state"], 1)
+
+    def test_summary_combines_rotations_and_all_install_failures(self):
+        (self.folder / "events.jsonl.2").write_text('{"event":"state","after":"FAULT_STOP","reason":"original"}\n')
+        (self.folder / "events.jsonl.1").write_text('{"event":"ultrasonic","reading":{"side":"left","status":"NO_ECHO"}}\n')
+        (self.folder / "events.jsonl").write_text('{"event":"ultrasonic","reading":{"side":"right","status":"VALID"}}\n')
+        (self.folder / "stages.tsv").write_text("step\tstatus\texit_code\nGPIO\tFAILED\t1\nROS\tBLOCKED\t78\nmodel\tOK\t0\n")
+        destination = create_bundle(self.folder)
+        with tarfile.open(destination) as archive:
+            summary = json.load(archive.extractfile("run/diagnostic_summary.json"))
+            self.assertEqual(summary["first_retained_fault"]["reason"], "original")
+            self.assertEqual(summary["ultrasonic_counts"], {"left": {"NO_ECHO": 1}, "right": {"VALID": 1}})
+            self.assertEqual(len(summary["failed_or_blocked_setup_stages"]), 2)
+
+    def test_manual_capture_can_refresh_same_path(self):
+        destination = create_bundle(self.folder, automatic=True)
+        original = destination.read_bytes()
+        (self.folder / "launcher.log").write_text("new manual snapshot\n")
+        self.assertEqual(create_bundle(self.folder), destination)
+        self.assertNotEqual(destination.read_bytes(), original)
+
+    def test_failed_compression_does_not_publish_partial_archive_or_remove_logs(self):
+        with mock.patch("jetson.amr_core.full_run_diagnostics.tarfile.open", side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                create_bundle(self.folder, automatic=True, reason="sensor_fault")
+        self.assertEqual(list(self.folder.parent.glob("*-debug.tar.gz")), [])
+        self.assertEqual(list(self.folder.parent.glob("*.part")), [])
+        self.assertFalse((self.folder / STATUS_FILE).exists())
+        self.assertTrue((self.folder / "events.jsonl").exists())
+        self.assertTrue(create_bundle(self.folder, automatic=True).exists())
+        self.assertEqual(json.loads((self.folder / REQUEST_FILE).read_text())["reason"], "sensor_fault")
+
+    def test_log_append_during_copy_does_not_corrupt_archive(self):
+        original = tarfile.TarFile.addfile
+        appended = []
+        def append_then_add(archive, entry, stream=None):
+            if entry.name.endswith("launcher.log"):
+                with (self.folder / "launcher.log").open("a", encoding="utf8") as writer:
+                    writer.write("appended while compression was reading\n")
+                appended.append(True)
+            return original(archive, entry, stream)
+        with mock.patch.object(tarfile.TarFile, "addfile", append_then_add):
+            destination = create_bundle(self.folder)
+        self.assertTrue(appended)
+        with tarfile.open(destination, "r:gz") as archive:
+            self.assertEqual(archive.extractfile("run/launcher.log").read(), b"startup\n")
+
+    def test_invalid_folder_is_rejected(self):
+        with self.assertRaises(ValueError):
+            create_bundle(self.folder.parent, automatic=True)
+
+    def test_cli_automatic_mode(self):
+        result = subprocess.run([sys.executable, str(ROOT / "scripts/full_run_diagnostics.py"),
+                                 str(self.folder), "--auto-bundle", "--reason", "configuration_error"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(Path(result.stdout.strip()).is_file())
+
+    def test_cli_summary_keeps_latest_per_port_RX_health(self):
+        health = {"active_status_port": "commands", "expected": "$STATUS",
+                  "ports": {"commands": {"rx_bytes": 128}, "status": {"rx_bytes": 0}}}
+        records = [{"event": "uart_health", "active_status_port": None, "ports": {}},
+                   {"event": "shutdown", "uart_rx": health}]
+        (self.folder / "events.jsonl").write_text(
+            "\n".join(json.dumps(r) for r in records) + "\n", encoding="utf8")
+        result = subprocess.run([sys.executable, str(ROOT / "scripts/full_run_diagnostics.py"), str(self.folder)],
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = json.loads(result.stdout)
+        self.assertEqual(summary["latest_uart_health"], health)
+        self.assertEqual(summary["event_counts"]["uart_health"], 1)
+
+    def test_cli_summary_accepts_old_records_without_RX_health(self):
+        result = subprocess.run([sys.executable, str(ROOT / "scripts/full_run_diagnostics.py"), str(self.folder)],
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIsNone(json.loads(result.stdout)["latest_uart_health"])
+
+    @unittest.skipUnless(os.name == "posix", "requires Unix file permissions")
+    def test_completed_archive_is_group_readable_without_world_access_or_group_write(self):
+        archive = create_bundle(self.folder, automatic=True)
+        mode = stat.S_IMODE(archive.stat().st_mode)
+        self.assertEqual(mode, 0o640)
+
+
+class EarlyLauncherFailureTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "requires Unix group/setgid permissions")
+    def test_log_directories_and_future_files_inherit_checkout_group_read_access(self):
+        with tempfile.TemporaryDirectory(prefix="full-run-log-access-") as temporary:
+            project = Path(temporary)
+            log_root = project / "logs/full_run_setup"
+            log_dir = log_root / "attempt"
+            log_dir.mkdir(parents=True)
+            for path in (project / "logs", log_root, log_dir):
+                path.chmod(0o700)
+            early = log_dir / "stages.tsv"
+            early.write_text("early file\n")
+            early.chmod(0o600)
+            result = subprocess.run(["/bin/bash", "-c", '''
+set -Eeuo pipefail
+source "$1"
+full_run_prepare_log_access "$2" "$3" "$4"
+umask 027
+mkdir "$4/child"
+printf 'future log\\n' > "$4/child/controller.log"
+''', "test-log-access", str(ROOT / "scripts/full_run_log_access.sh"),
+                                     str(project), str(log_root), str(log_dir)],
+                                    capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            group = project.stat().st_gid
+            for path in (project / "logs", log_root, log_dir, log_dir / "child"):
+                self.assertEqual(path.stat().st_gid, group)
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o2750)
+            for path in (early, log_dir / "launcher.log", log_dir / "child/controller.log"):
+                self.assertEqual(path.stat().st_gid, group)
+                self.assertTrue(path.stat().st_mode & stat.S_IRGRP)
+                self.assertFalse(path.stat().st_mode & stat.S_IWGRP)
+
+    def test_startup_failure_archives_without_opening_actuator(self):
+        # Only the platform guard is replaced in a disposable checkout. No
+        # device exists and startup fails at dependency discovery. This tests
+        # the real EXIT trap on Windows Git Bash as well as Linux Bash.
+        bash = shutil.which("bash") if os.name == "posix" else r"C:\Program Files\Git\bin\bash.exe"
+        if not bash or not Path(bash).is_file():
+            self.skipTest("No runnable Bash")
+        with tempfile.TemporaryDirectory(prefix="full-run-early-exit-") as temporary:
+            folder = Path(temporary)
+            (folder / "scripts").mkdir()
+            (folder / "jetson/amr_core").mkdir(parents=True)
+            source = (ROOT / "scripts/start_full_run.sh").read_text()
+            source = source.replace('[[ "$(uname -s)" == Linux ]]', '[[ 1 == 1 ]]')
+            (folder / "scripts/start_full_run.sh").write_text(source, encoding="utf8")
+            shutil.copyfile(ROOT / "scripts/full_run_diagnostics.py", folder / "scripts/full_run_diagnostics.py")
+            shutil.copyfile(ROOT / "scripts/full_run_log_access.sh", folder / "scripts/full_run_log_access.sh")
+            shutil.copyfile(ROOT / "jetson/amr_core/full_run_diagnostics.py", folder / "jetson/amr_core/full_run_diagnostics.py")
+            environment = dict(os.environ, PYTHON_BIN=sys.executable.replace("\\", "/"),
+                               ROS_SETUP=str(folder / "missing-ros-setup"))
+            for key in ("FULL_RUN_LOG_ROOT", "FULL_RUN_LOG_DIR", "LIDAR_SETUP", "PYTHONPATH"):
+                environment.pop(key, None)
+            environment.pop("JETSON_MODEL_NAME", None)
+            result = subprocess.run([bash, str(folder / "scripts/start_full_run.sh")],
+                                    env=environment, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, timeout=30)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            archives = list((folder / "logs/full_run").glob("*-debug.tar.gz"))
+            self.assertEqual(len(archives), 1, result.stdout)
+            self.assertIn("[BUNDLE] Saved:", result.stdout)
+            self.assertIn("[GPIO] JETSON_MODEL_NAME=JETSON_ORIN_NANO", result.stdout)
+            self.assertIn("[LOG_ACCESS]", result.stdout)
+            with tarfile.open(archives[0], "r:gz") as archive:
+                self.assertTrue(any(path.endswith("launcher.log") for path in archive.getnames()))
+
+
+if __name__ == "__main__":
+    unittest.main()

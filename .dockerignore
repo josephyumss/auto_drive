@@ -1,0 +1,12 @@
+.git
+.github
+.run
+.runtime
+logs
+models
+tests
+jetson_ws/build
+jetson_ws/install
+jetson_ws/log
+**/__pycache__
+config/full_run.env
