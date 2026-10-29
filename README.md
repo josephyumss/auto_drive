@@ -96,9 +96,6 @@ python -m unittest discover -s tests -v
 
 가상 센서·UART·ROS와 이상적인 바퀴 피드백으로 두 모드의 판단, 정지, 우회·복귀 및 설치/종료 처리를 검사합니다. Linux 프로세스 관리 테스트는 Windows에서 건너뜁니다. 실제 로봇의 주행 정확도·제동거리 검증은 별도로 필요합니다.
 
-## 출처
-
-원본: [josephyumss/test_drive](https://github.com/josephyumss/test_drive), 커밋 `ba6cb97`.
-핵심 주행 로직을 그대로 가져오고 실행에 필요한 의존성만 남겼습니다. 분리 과정의 변경 사항은 [출처 및 범위](docs/provenance.md)에 기록했습니다.
+## 라이선스
 
 라이선스는 저장소의 [MIT License](LICENSE)를 따릅니다. 설치 시 내려받는 외부 소프트웨어와 모델의 라이선스는 각 배포처를 따릅니다.
