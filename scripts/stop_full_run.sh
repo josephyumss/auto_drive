@@ -24,7 +24,14 @@ else
     kill -TERM "$pid"
 fi
 for _ in {1..100}; do
-    kill -0 "$pid" 2>/dev/null || { echo '[STOP] Full run stopped. Restart with sudo bash scripts/start_full_run.sh'; exit 0; }
+    # kill -0 also succeeds for an exited child until its parent reaps it.
+    # A helper cannot reap another parent's child; /proc state distinguishes
+    # that completed launcher from a process still performing cleanup.
+    process_state="$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || true)"
+    if ! kill -0 "$pid" 2>/dev/null || [[ "$process_state" == Z || "$process_state" == X ]]; then
+        echo '[STOP] Full run stopped. Restart with sudo bash scripts/start_full_run.sh'
+        exit 0
+    fi
     sleep 0.1
 done
 echo '[WARN] Stop requested; launcher cleanup has not finished. Inspect latest/launcher.log.'
